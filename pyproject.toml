@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Kubernetes operator that runs one Hermes personal agent per Twake Space user who turns on the assistant"
 requires-python = ">=3.13"
 dependencies = [
+    "httpx>=0.28.1",
     "kopf>=1.44",
     "kubernetes-asyncio>=33",
     "pyyaml>=6",

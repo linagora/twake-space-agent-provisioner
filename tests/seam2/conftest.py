@@ -16,6 +16,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from tests.seam2.fake_homeserver import FakeHomeserver
 from tests.seam2.harness import OperatorHarness
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -23,6 +24,8 @@ CRD_PATH = REPO_ROOT / "deploy" / "crd.yaml"
 STUB_DIR = REPO_ROOT / "tests" / "stub"
 
 STUB_IMAGE = "twake-space-agent-stub:test"
+#: The appservice token both the operator and the fake homeserver agree on.
+APPSERVICE_TOKEN = "test-appservice-token"
 #: An interval short enough that the suite stays quick. Set before the operator
 #: module is imported, since the timer's interval is read then.
 RECONCILE_INTERVAL = "1"
@@ -37,6 +40,17 @@ def _kubectl(*args: str, input_text: str | None = None) -> subprocess.CompletedP
         text=True,
         check=True,
     )
+
+
+@pytest.fixture(scope="session")
+def homeserver() -> Iterator[FakeHomeserver]:
+    """The fake homeserver: the only fake, standing for Synapse.
+
+    Session-scoped so the port is stable for every template that points at it.
+    """
+    server = FakeHomeserver(appservice_token=APPSERVICE_TOKEN).start()
+    yield server
+    server.stop()
 
 
 @pytest.fixture(scope="session")
@@ -134,8 +148,8 @@ def _personalagent_names(context: str, namespace: str) -> list[str]:
 
 
 @pytest.fixture
-def template_file(tmp_path: Path, stub_image: str) -> Path:
-    """The agent template, pointed at the stub image and one worker."""
+def template_file(tmp_path: Path, stub_image: str, homeserver: FakeHomeserver) -> Path:
+    """The agent template, pointed at the stub image and the fake homeserver."""
     path = tmp_path / "template.yaml"
     path.write_text(
         f"""
@@ -150,8 +164,8 @@ persistence:
   size: 10Mi
   storageClass: ""
 homeserver:
-  url: https://matrix.test.invalid
-  serverName: test.invalid
+  url: {homeserver.url}
+  serverName: {homeserver.server_name}
 ceiling: 50
 defaultLanguage: fr
 managedConfig:
@@ -188,6 +202,26 @@ def operator(
         template_path=template_file,
         context=cluster_context,
         reconcile_interval=RECONCILE_INTERVAL,
+        appservice_token=APPSERVICE_TOKEN,
+    )
+    with harness:
+        yield harness
+
+
+@pytest.fixture
+def operator_with_bad_token(
+    namespace: str, template_file: Path, cluster_context: str
+) -> Iterator[OperatorHarness]:
+    """The operator holding an appservice token the homeserver rejects.
+
+    A permanent refusal: the agent must fail rather than retry forever.
+    """
+    harness = OperatorHarness(
+        namespace=namespace,
+        template_path=template_file,
+        context=cluster_context,
+        reconcile_interval=RECONCILE_INTERVAL,
+        appservice_token="the-wrong-token",
     )
     with harness:
         yield harness
@@ -215,6 +249,7 @@ def operator_with_ai_key(
         context=cluster_context,
         reconcile_interval=RECONCILE_INTERVAL,
         ai_gateway_secret_name=shared_secret,
+        appservice_token=APPSERVICE_TOKEN,
     )
     with harness:
         yield harness

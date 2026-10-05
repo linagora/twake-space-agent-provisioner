@@ -67,6 +67,7 @@ def objects(template: Template):
         profile={"firstName": "Jean", "language": "fr", "timezone": "Europe/Paris"},
         template=template,
         api_server_key="api-key-value",
+        matrix_access_token="matrix-token",
     )
 
 
@@ -92,6 +93,7 @@ class TestConfigMap:
         objects = build_objects(
             name=NAME, username=USERNAME, profile={}, template=template,
             api_server_key="k",
+            matrix_access_token="matrix-token",
         )
         config = yaml.safe_load(objects.configmap["data"]["config.yaml"])
         assert "timezone" not in config
@@ -104,6 +106,7 @@ class TestConfigMap:
             name=NAME, username=USERNAME,
             profile={"firstName": "Jean", "language": "en"}, template=template,
             api_server_key="k",
+            matrix_access_token="matrix-token",
         )
         assert objects.configmap["data"]["SOUL.md"] == "You are Jean's personal assistant."
 
@@ -111,6 +114,7 @@ class TestConfigMap:
         objects = build_objects(
             name=NAME, username=USERNAME,
             profile={"displayName": "Jean Dupont"}, template=template, api_server_key="k",
+            matrix_access_token="matrix-token",
         )
         assert objects.configmap["data"]["SOUL.md"] == (
             "Tu es l'assistant personnel de Jean Dupont."
@@ -120,6 +124,7 @@ class TestConfigMap:
         objects = build_objects(
             name=NAME, username=USERNAME, profile={}, template=template,
             api_server_key="k",
+            matrix_access_token="matrix-token",
         )
         assert objects.configmap["data"]["SOUL.md"] == (
             "Tu es l'assistant personnel de jean.dupont."
@@ -131,12 +136,56 @@ class TestSecret:
         assert objects.secret["metadata"]["name"] == "hermes-user-jean-dupont-managed-env"
         assert objects.secret["stringData"]["API_SERVER_KEY"] == "api-key-value"
 
+    def test_holds_the_matrix_token_so_it_survives_a_reconcile(self, objects) -> None:
+        assert objects.secret["stringData"]["MATRIX_ACCESS_TOKEN"] == "matrix-token"
+
     def test_carries_hermes_managed_environment(self, objects) -> None:
         assert objects.secret["stringData"]["API_SERVER_KEY"] == "api-key-value"
 
     def test_never_carries_the_shared_ai_gateway_key(self, objects) -> None:
         blob = " ".join(str(objects.secret.get("stringData", {})).split())
         assert "LINAGORA_API_KEY" not in blob
+
+
+class TestManagedEnvironment:
+    """The Matrix identity Hermes reads from the .env file."""
+
+    def _env(self, objects) -> dict[str, str]:
+        lines = objects.secret["stringData"][".env"]
+        return dict(line.split("=", 1) for line in lines.splitlines())
+
+    def test_points_the_agent_at_the_homeserver(self, objects) -> None:
+        assert self._env(objects)["MATRIX_HOMESERVER"] == (
+            "https://matrix.dev.twake.lin-saas.com"
+        )
+
+    def test_gives_the_agent_its_bot_identity(self, objects) -> None:
+        env = self._env(objects)
+        assert env["MATRIX_USER_ID"] == (
+            "@twake-space-assistant-jean-dupont:dev.twake.lin-saas.com"
+        )
+        assert env["MATRIX_DEVICE_ID"] == "HERMESJEANDUPONT"
+        assert env["MATRIX_ACCESS_TOKEN"] == "matrix-token"
+
+    def test_keeps_encryption_optional_with_a_recovery_key_on_the_volume(self, objects) -> None:
+        env = self._env(objects)
+        assert env["MATRIX_E2EE_MODE"] == "optional"
+        assert env["MATRIX_RECOVERY_KEY_OUTPUT_FILE"] == (
+            "/opt/data/platforms/matrix/recovery-key.txt"
+        )
+
+    def test_answers_its_owner_alone(self, objects) -> None:
+        env = self._env(objects)
+        assert env["MATRIX_ALLOWED_USERS"] == "@jean.dupont:dev.twake.lin-saas.com"
+
+    def test_ignores_the_owners_case_for_the_matrix_id(self, template) -> None:
+        objects = build_objects(
+            name=NAME, username="Jean.Dupont", profile={"firstName": "Jean"},
+            template=template, api_server_key="k", matrix_access_token="t",
+        )
+        lines = objects.secret["stringData"][".env"]
+        env = dict(line.split("=", 1) for line in lines.splitlines())
+        assert env["MATRIX_ALLOWED_USERS"] == "@jean.dupont:dev.twake.lin-saas.com"
 
 
 class TestNetworkPolicy:
@@ -221,10 +270,12 @@ class TestStatefulSet:
         first = build_objects(
             name=NAME, username=USERNAME, profile={"firstName": "Jean"},
             template=template, api_server_key="k",
+            matrix_access_token="matrix-token",
         )
         second = build_objects(
             name=NAME, username=USERNAME, profile={"firstName": "Jean"},
             template=other, api_server_key="k",
+            matrix_access_token="matrix-token",
         )
         a1 = first.statefulset["spec"]["template"]["metadata"]["annotations"]
         a2 = second.statefulset["spec"]["template"]["metadata"]["annotations"]
@@ -241,6 +292,7 @@ class TestAiGatewayKey:
         objects = build_objects(
             name=NAME, username=USERNAME, profile={"firstName": "Jean"},
             template=template, api_server_key="k",
+            matrix_access_token="matrix-token",
             ai_gateway_secret_name="provisioner-shared",
             ai_gateway_key="super-secret",
         )

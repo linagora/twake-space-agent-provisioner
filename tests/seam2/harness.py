@@ -100,12 +100,14 @@ class OperatorHarness:
         context: str,
         reconcile_interval: str = TEST_RECONCILE_INTERVAL,
         ai_gateway_secret_name: str | None = None,
+        appservice_token: str | None = None,
     ) -> None:
         self.namespace = namespace
         self.template_path = template_path
         self.context = context
         self.reconcile_interval = reconcile_interval
         self.ai_gateway_secret_name = ai_gateway_secret_name
+        self.appservice_token = appservice_token
         self.kubectl = Kubectl(context=context, namespace=namespace)
         self._runner: KopfRunner | None = None
         self._captured_output = ""
@@ -116,6 +118,8 @@ class OperatorHarness:
         os.environ["PROVISIONER_NAMESPACE"] = self.namespace
         if self.ai_gateway_secret_name:
             os.environ["AI_GATEWAY_SECRET_NAME"] = self.ai_gateway_secret_name
+        if self.appservice_token:
+            os.environ["MATRIX_APPSERVICE_TOKEN"] = self.appservice_token
         # Read when the operator module is imported, hence once per process.
         os.environ["PROVISIONER_RECONCILE_INTERVAL"] = self.reconcile_interval
         self._runner = KopfRunner(
@@ -132,7 +136,12 @@ class OperatorHarness:
 
     def __exit__(self, exc_type=None, exc_val=None, exc_tb=None) -> None:
         self.stop()
-        for key in ("AGENT_TEMPLATE_PATH", "PROVISIONER_NAMESPACE", "AI_GATEWAY_SECRET_NAME"):
+        for key in (
+            "AGENT_TEMPLATE_PATH",
+            "PROVISIONER_NAMESPACE",
+            "AI_GATEWAY_SECRET_NAME",
+            "MATRIX_APPSERVICE_TOKEN",
+        ):
             os.environ.pop(key, None)
 
     def stop(self) -> None:

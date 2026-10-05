@@ -22,7 +22,7 @@ from typing import Any
 import yaml
 
 from . import naming
-from .template import Template, owner_name
+from .template import Homeserver, Template, owner_name
 
 #: Where the provisioner keeps the shared AI Gateway key. Read by the pod as an
 #: environment variable; never copied into the agent's own Secret.
@@ -77,26 +77,37 @@ def build_objects(
     profile: dict[str, Any],
     template: Template,
     api_server_key: str,
+    matrix_access_token: str,
     owner: dict[str, Any] | None = None,
     ai_gateway_secret_name: str | None = None,
     ai_gateway_key: str | None = None,
 ) -> AgentObjects:
     """Render every object for one owner.
 
-    ``ai_gateway_key`` is only used to fold the key's identity into the pod
-    checksum; the key itself is never written into any object.
+    ``matrix_access_token`` is the bot's token, obtained once and kept in the
+    Secret across reconciles. ``ai_gateway_key`` is only used to fold the key's
+    identity into the pod checksum; the key itself is never written into any
+    object.
     """
     owner_display = owner_name(
         profile.get("firstName"), profile.get("displayName"), username
     )
     language = profile.get("language")
 
+    device = naming.device_id(name)
     rendered_config = _managed_config(template, profile)
     persona = template.persona(language, owner_display)
-    managed_env = _managed_env(api_server_key)
+    managed_env = _managed_env(
+        api_server_key,
+        name=name,
+        username=username,
+        homeserver=template.homeserver,
+        access_token=matrix_access_token,
+        device_id=device,
+    )
 
     configmap = _configmap(name, rendered_config, persona, owner)
-    secret = _secret(name, managed_env, api_server_key, owner)
+    secret = _secret(name, managed_env, api_server_key, matrix_access_token, owner)
     networkpolicy = _networkpolicy(name, owner)
     statefulset = _statefulset(
         name=name,
@@ -124,13 +135,33 @@ def _managed_config(template: Template, profile: dict[str, Any]) -> dict[str, An
     return config
 
 
-def _managed_env(api_server_key: str) -> dict[str, str]:
+def _managed_env(
+    api_server_key: str,
+    *,
+    name: str,
+    username: str,
+    homeserver: Homeserver,
+    access_token: str,
+    device_id: str,
+) -> dict[str, str]:
     """Hermes' managed environment, written as a .env file.
 
-    The Matrix identity joins this in a later slice; the API server key is what
-    this slice needs so the gateway's health endpoint can authenticate.
+    The Matrix identity is the agent's own account, taken from the pilot agent's
+    real configuration. ``MATRIX_ALLOWED_USERS`` is the owner alone, so the
+    agent answers nobody else.
     """
-    return {"API_SERVER_KEY": api_server_key}
+    return {
+        "API_SERVER_KEY": api_server_key,
+        "MATRIX_ACCESS_TOKEN": access_token,
+        "MATRIX_HOMESERVER": homeserver.url,
+        "MATRIX_USER_ID": naming.bot_user_id(name, homeserver.server_name),
+        "MATRIX_DEVICE_ID": device_id,
+        # Encrypted rooms when crypto starts; plain rooms keep working if it
+        # does not. Hermes writes the recovery key here on first start.
+        "MATRIX_E2EE_MODE": "optional",
+        "MATRIX_RECOVERY_KEY_OUTPUT_FILE": f"{DATA_DIR}/platforms/matrix/recovery-key.txt",
+        "MATRIX_ALLOWED_USERS": naming.owner_id(username, homeserver.server_name),
+    }
 
 
 def _configmap(
@@ -148,7 +179,11 @@ def _configmap(
 
 
 def _secret(
-    name: str, managed_env: dict[str, str], api_server_key: str, owner: dict[str, Any] | None
+    name: str,
+    managed_env: dict[str, str],
+    api_server_key: str,
+    matrix_access_token: str,
+    owner: dict[str, Any] | None,
 ) -> dict[str, Any]:
     lines = "".join(f"{key}={value}\n" for key, value in sorted(managed_env.items()))
     return {
@@ -158,7 +193,10 @@ def _secret(
         "metadata": _metadata(naming.secret_name(name), name, owner),
         "stringData": {
             ".env": lines,
+            # Both are surfaced as individual keys so the operator can read the
+            # existing ones back, and the pod can mount them where needed.
             "API_SERVER_KEY": api_server_key,
+            "MATRIX_ACCESS_TOKEN": matrix_access_token,
         },
     }
 

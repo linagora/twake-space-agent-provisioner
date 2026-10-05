@@ -16,7 +16,8 @@ import base64
 import logging
 import os
 import secrets
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -25,6 +26,7 @@ import kopf
 from . import naming
 from .cluster import Cluster
 from .config import Config
+from .matrix import HomeserverError, MatrixAppservice, RateLimited, retry_delay
 from .objects import build_objects
 from .template import Template
 
@@ -47,12 +49,28 @@ RECONCILE_INTERVAL = float(os.environ.get("PROVISIONER_RECONCILE_INTERVAL", "15"
 
 
 @dataclass
+class Retry:
+    """A pending retry for one agent, after a homeserver refusal."""
+
+    attempts: int
+    #: ``time.monotonic()`` value at which the next attempt is due.
+    due: float
+    #: The status reason the refusal earned, kept while the agent waits so a
+    #: backoff pass does not erase what the homeserver said.
+    reason: str
+
+
+@dataclass
 class Context:
     """What the handlers need, built once at startup."""
 
     config: Config
     template: Template
     cluster: Cluster
+    matrix: MatrixAppservice | None = None
+    #: Per-agent retry gate, so a homeserver outage backs off instead of
+    #: hammering. In-memory is enough: a restart just means one more reconcile.
+    retries: dict[str, Retry] = field(default_factory=dict)
 
 
 @kopf.on.startup()
@@ -76,7 +94,14 @@ async def startup(memo: kopf.Memo, settings: kopf.OperatorSettings, **_: Any) ->
     config = Config.from_env()
     template = Template.load(config.template_path)
     cluster = await Cluster.connect()
-    memo["context"] = Context(config=config, template=template, cluster=cluster)
+    matrix = None
+    if config.appservice_token:
+        matrix = MatrixAppservice(
+            base_url=template.homeserver.url, appservice_token=config.appservice_token
+        )
+    memo["context"] = Context(
+        config=config, template=template, cluster=cluster, matrix=matrix
+    )
     logger.info(
         "provisioner started in namespace %s, template %s",
         config.namespace,
@@ -89,6 +114,8 @@ async def cleanup(memo: kopf.Memo, **_: Any) -> None:
     context: Context | None = memo.get("context")
     if context is not None:
         await context.cluster.close()
+        if context.matrix is not None:
+            await context.matrix.close()
 
 
 @kopf.on.timer(
@@ -121,6 +148,17 @@ async def reconcile(body: kopf.Body, patch: kopf.Patch, memo: kopf.Memo, **_: An
         _fail(body, patch, log, "InvalidUsername", f"invalid username {username!r}")
         return
 
+    if context.matrix is None:
+        _fail(
+            body,
+            patch,
+            log,
+            "NoAppserviceToken",
+            "MATRIX_APPSERVICE_TOKEN is not configured: the operator cannot register "
+            "the agent's bot",
+        )
+        return
+
     # The phase as it was before this pass, so a step's event is posted on the
     # transition into it, not on every reconcile.
     previous_phase = (body.get("status") or {}).get("phase")
@@ -130,12 +168,47 @@ async def reconcile(body: kopf.Body, patch: kopf.Patch, memo: kopf.Memo, **_: An
 
     profile = spec.get("profile") or {}
     api_server_key = await _reuse_or_generate_api_server_key(context, name)
+
+    # A homeserver outage is retried with a backoff: while a retry is pending,
+    # this pass leaves the agent alone rather than hammering the homeserver,
+    # and keeps the reason the refusal set so it stays visible in the status.
+    pending = context.retries.get(name)
+    if pending is not None and time.monotonic() < pending.due:
+        patch.status["phase"] = PHASE_PROVISIONING
+        patch.status["reason"] = pending.reason
+        return
+
+    # Bot account and session: register once, log in once. On a re-activation
+    # or a takeover the bot and its existing token are reused unchanged.
+    try:
+        matrix_token = await _ensure_bot_session(context, name, log)
+    except HomeserverError as error:
+        # A transient refusal leaves the agent Provisioning for the next pass;
+        # a permanent one fails it outright. Either way the reason is set.
+        await _retry_later(body, patch, log, error, context, name)
+        return
+    _clear_retry(context, name)
+
+    device = naming.device_id(name)
+    patch.status["botUserId"] = naming.bot_user_id(name, context.template.homeserver.server_name)
+    patch.status["deviceId"] = device
+    # Conditions accumulate across the pass: each step adds its own, and later
+    # steps must not drop what an earlier one recorded.
+    conditions = _with_condition(
+        _conditions_of(body),
+        "botRegistered",
+        "True",
+        "the agent's bot is registered",
+    )
+    patch.status["conditions"] = conditions
+
     objects = build_objects(
         name=name,
         username=username,
         profile=profile,
         template=context.template,
         api_server_key=api_server_key,
+        matrix_access_token=matrix_token,
         owner=body,
         ai_gateway_secret_name=context.config.ai_gateway_secret_name,
     )
@@ -158,14 +231,14 @@ async def reconcile(body: kopf.Body, patch: kopf.Patch, memo: kopf.Memo, **_: An
         patch.status["phase"] = PHASE_READY
         patch.status["reason"] = "ready"
         patch.status["conditions"] = _with_condition(
-            body, "workloadReady", "True", "the agent pod is ready"
+            conditions, "workloadReady", "True", "the agent pod is ready"
         )
         log.info("agent ready for username %s", username)
         if previous_phase != PHASE_READY:
             kopf.info(body, reason="Ready", message=f"the agent pod is ready for {username}")
     else:
         patch.status["conditions"] = _with_condition(
-            body, "workloadReady", "False", "waiting for the agent pod"
+            conditions, "workloadReady", "False", "waiting for the agent pod"
         )
 
 
@@ -196,6 +269,89 @@ async def _reuse_or_generate_api_server_key(context: Context, name: str) -> str:
     return secrets.token_urlsafe(32)
 
 
+async def _ensure_bot_session(
+    context: Context, name: str, log: logging.LoggerAdapter
+) -> str:
+    """The bot's access token: obtained once, kept in the Secret afterwards.
+
+    Registering is idempotent ("user in use" is success). A login only happens
+    when the Secret holds no token yet, so re-running the reconcile never
+    issues a second session, which would mean a new device and new keys.
+    """
+    existing = await context.cluster.get_secret(
+        context.config.namespace, naming.secret_name(name)
+    )
+    if existing is not None:
+        encoded = (existing.get("data") or {}).get("MATRIX_ACCESS_TOKEN")
+        if encoded:
+            return base64.b64decode(encoded).decode()
+
+    matrix = context.matrix
+    assert matrix is not None, "reconcile refuses an agent before this point"
+
+    user_id = naming.bot_user_id(name, context.template.homeserver.server_name)
+    device = naming.device_id(name)
+    await matrix.register_bot(user_id)
+    session = await matrix.login_bot(user_id, device)
+    log.info("bot registered and logged in for username %s", user_id)
+    return session.access_token
+
+
+async def _retry_later(
+    body: kopf.Body,
+    patch: kopf.Patch,
+    log: logging.LoggerAdapter,
+    error: HomeserverError,
+    context: Context,
+    name: str,
+) -> None:
+    """Leave the agent Provisioning and set the next attempt's delay.
+
+    The status reason names what the homeserver said and stays put while the
+    agent waits, so an outage is visible on every pass, not only on the one
+    that met it. A rate limit sets the pace when it asks for longer than our
+    own backoff: the homeserver knows its own load. A refusal a retry cannot
+    fix (a bad appservice token, say) fails the agent outright instead of
+    looping forever.
+    """
+    if not error.retryable:
+        _fail(
+            body,
+            patch,
+            log,
+            f"Homeserver{error.errcode}",
+            f"the homeserver refused {error.errcode}: {error.message}",
+        )
+        return
+
+    attempts = context.retries[name].attempts + 1 if name in context.retries else 1
+    rate_limit = error if isinstance(error, RateLimited) else None
+    delay = retry_delay(attempts, rate_limit=rate_limit)
+    reason = f"homeserver:{error.errcode}"
+    context.retries[name] = Retry(
+        attempts=attempts, due=time.monotonic() + delay, reason=reason
+    )
+
+    patch.status["phase"] = PHASE_PROVISIONING
+    patch.status["reason"] = reason
+    patch.status["conditions"] = _with_condition(
+        _conditions_of(body),
+        "botRegistered",
+        "False",
+        f"the homeserver refused {error.errcode}; retrying in {delay:.0f}s",
+    )
+    log.warning("homeserver error, retrying in %.0fs: %s", delay, error)
+
+
+def _conditions_of(body: kopf.Body) -> list[dict[str, Any]]:
+    """The conditions the resource currently carries, or an empty list."""
+    return (body.get("status") or {}).get("conditions") or []
+
+
+def _clear_retry(context: Context, name: str) -> None:
+    context.retries.pop(name, None)
+
+
 async def _pod_is_ready(context: Context, name: str) -> bool:
     pods = await context.cluster.list_pods(
         context.config.namespace,
@@ -209,15 +365,17 @@ async def _pod_is_ready(context: Context, name: str) -> bool:
 
 
 def _with_condition(
-    body: kopf.Body, type_: str, status_: str, message: str
+    existing: list[dict[str, Any]], type_: str, status_: str, message: str
 ) -> list[dict[str, Any]]:
     """The condition list, with one entry replaced or appended.
+
+    ``existing`` is the list as it stands in this pass, not the resource's: a
+    step passes the list a previous step added to, so conditions accumulate.
 
     ``lastTransitionTime`` moves only when the status changes, per the
     Kubernetes condition convention: the time marks the transition, not the
     last time the operator looked.
     """
-    existing = list((body.get("status") or {}).get("conditions") or [])
     previous = next((c for c in existing if c.get("type") == type_), None)
     others = [c for c in existing if c.get("type") != type_]
     unchanged = previous is not None and previous.get("status") == status_

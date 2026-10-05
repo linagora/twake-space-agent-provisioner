@@ -15,6 +15,7 @@ class Config:
     namespace: str
     template_path: Path
     ai_gateway_secret_name: str | None
+    appservice_token: str | None = None
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
@@ -23,4 +24,7 @@ class Config:
             namespace=env.get("PROVISIONER_NAMESPACE", DEFAULT_NAMESPACE),
             template_path=Path(env.get("AGENT_TEMPLATE_PATH", DEFAULT_TEMPLATE_PATH)),
             ai_gateway_secret_name=env.get("AI_GATEWAY_SECRET_NAME") or None,
+            # The appservice token the provisioner registers bots with. It stays
+            # in the provisioner and never reaches an agent's objects.
+            appservice_token=env.get("MATRIX_APPSERVICE_TOKEN") or None,
         )
