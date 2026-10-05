@@ -39,6 +39,10 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# The seam 2 modules import each other as `tests.seam2....`. `python -m pytest`
+# happens to put the working directory on the path; the `pytest` script does
+# not, so declare it here rather than depend on how the runner was started.
+pythonpath = ["."]
 markers = [
     "seam1: settings event -> PersonalAgent (needs kind + RabbitMQ)",
     "seam2: PersonalAgent -> running agent (needs kind)",
