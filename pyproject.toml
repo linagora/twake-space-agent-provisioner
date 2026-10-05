@@ -1,0 +1,44 @@
+[project]
+name = "twake-space-agent-provisioner"
+version = "0.1.0"
+description = "Kubernetes operator that runs one Hermes personal agent per Twake Space user who turns on the assistant"
+requires-python = ">=3.13"
+dependencies = [
+    "kopf>=1.44",
+    "kubernetes-asyncio>=33",
+    "pyyaml>=6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=1",
+    "ruff>=0.9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/twake_space_agent_provisioner"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests reach for the Kubernetes models and the stub binary freely
+"tests/*" = ["S101"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "seam1: settings event -> PersonalAgent (needs kind + RabbitMQ)",
+    "seam2: PersonalAgent -> running agent (needs kind)",
+]

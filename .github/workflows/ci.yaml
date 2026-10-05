@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-unit:
+    name: Lint and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Lint
+        run: uv run ruff check .
+      - name: Unit tests
+        run: uv run pytest tests/unit -q
+
+  seam2:
+    name: Seam 2 (kind)
+    runs-on: ubuntu-latest
+    needs: lint-and-unit
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Create the kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: provisioner-test
+          wait: 120s
+      - name: Show the cluster
+        run: kubectl get nodes
+      # The bench builds the stub agent image and loads it into kind itself;
+      # the operator runs inside the test process. See tests/seam2/conftest.py.
+      - name: Seam 2 tests
+        env:
+          PROVISIONER_TEST_CONTEXT: kind-provisioner-test
+        run: uv run pytest tests/seam2 -q
+      - name: Operator logs on failure
+        if: failure()
+        run: |
+          kubectl get pods -A || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true

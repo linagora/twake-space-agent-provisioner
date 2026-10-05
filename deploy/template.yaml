@@ -1,0 +1,108 @@
+# The agent template.
+#
+# Part of the provisioner release's configuration in the deployment repository,
+# mounted into the provisioner. It starts from the pilot personal agent's
+# configuration. Editing it is a reviewed merge request, and a change rolls
+# every agent to the new version through the pod's checksums.
+#
+# The image is pinned by digest: upstream only publishes date tags and merges
+# about 150 pull requests a day.
+
+image:
+  repository: docker.io/nousresearch/hermes-agent
+  tag: v2026.9.24
+  digest: ""  # set in the deployment repository
+  pullPolicy: IfNotPresent
+
+# Hermes asks for 1 GB at least, 2 to 4 GB recommended; about 250 MiB measured
+# at rest. Set these and the ceiling together, according to the cluster's size.
+resources:
+  requests:
+    cpu: 250m
+    memory: 1Gi
+  limits:
+    cpu: "2"
+    memory: 3Gi
+
+persistence:
+  size: 5Gi
+  # Empty uses the cluster default
+  storageClass: ""
+
+homeserver:
+  url: https://matrix.dev.twake.lin-saas.com
+  serverName: dev.twake.lin-saas.com
+
+# The ceiling on the number of personal agents. A wave of activations cannot
+# exhaust the cluster; agents above it wait and start on their own when room
+# frees up.
+ceiling: 50
+
+# French and English to start, French by default.
+defaultLanguage: fr
+
+# Hermes' managed configuration. Overlaid on the config.yaml of the data volume,
+# so neither the agent nor the boot-time migrations can change what is pinned
+# here.
+managedConfig:
+  model:
+    provider: custom
+    default: qwen3.8
+    base_url: https://ai-api.linagora.com/v1
+    key_env: LINAGORA_API_KEY
+
+  # Allow-list per surface: upstream adds toolsets often, and a new one must not
+  # reach the agent.
+  platform_toolsets:
+    matrix: [memory, session_search, skills, clarify, todo]
+    api_server: [memory, session_search, skills, todo]
+    cron: [memory, session_search, skills, todo]
+
+  agent:
+    # Removed everywhere even if a list above names them: the agent acts only
+    # through APISIX contracts.
+    disabled_toolsets: [terminal, file, code_execution, browser, web, search, delegation, cronjob, computer_use, connections, image_gen, video_gen, tts, vision, video, kanban, x_search]
+
+  skills:
+    # LINAGORA writes the skills: what the agent proposes stays staged.
+    write_approval: true
+    project_discovery: false
+
+  # Maintains agent-written skills, which write_approval keeps out.
+  curator:
+    enabled: false
+
+  display:
+    # qwen3.8 reasons before answering: keep that out of the chat.
+    show_reasoning: false
+
+  memory:
+    # The pilot showed memory notifications for testing only; turn them off.
+    nudge_interval: 0
+
+# The persona is copied to SOUL.md at every start: the first slot of the system
+# prompt. {name} is the owner's first name, or else their display name, or else
+# their username.
+persona:
+  fr: |
+    Tu es l'assistant personnel de {name} dans Twake Space, la plateforme collaborative de LINAGORA.
+    Tu agis uniquement pour son compte, et tu ne parles qu'avec lui.
+    Tu réponds en français, de façon concise et factuelle.
+    Tu n'as pas encore accès à ses applications (calendrier, mail, fichiers) : si on te demande une donnée ou une action que tu ne peux pas obtenir, dis-le simplement, sans rien inventer.
+  en: |
+    You are {name}'s personal assistant in Twake Space, LINAGORA's collaborative platform.
+    You act only on their behalf, and you speak only with them.
+    You answer in English, concisely and factually.
+    You do not yet have access to their applications (calendar, mail, files): if asked for a datum or an action you cannot obtain, say so plainly, and invent nothing.
+
+# The welcome message, posted in plain text as the room's first message, before
+# encryption is turned on. {name} is the owner's name, as above.
+welcome:
+  fr: |
+    Bonjour {name} ! Je suis votre assistant personnel Twake Space.
+    Je peux pour l'instant retenir ce que vous me dites et chercher dans nos échanges passés. Je n'ai pas encore accès à vos applications.
+    Posez-moi une question pour commencer.
+  en: |
+    Hello {name}! I am your Twake Space personal assistant.
+    For now I can remember what you tell me and search our past exchanges. I do not yet have access to your applications.
+    Ask me a question to get started.

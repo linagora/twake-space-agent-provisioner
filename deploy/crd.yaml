@@ -1,0 +1,125 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: personalagents.twake-space.linagora.com
+  annotations:
+    # Helm's keep policy: upgrades update the CRD, uninstalling never deletes
+    # it, so removing the provisioner cannot cascade-delete agents.
+    "helm.sh/resource-policy": keep
+spec:
+  group: twake-space.linagora.com
+  names:
+    kind: PersonalAgent
+    listKind: PersonalAgentList
+    plural: personalagents
+    singular: personalagent
+    shortNames: [pa]
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+          description: Where the agent stands
+        - name: Username
+          type: string
+          jsonPath: .spec.username
+        - name: Reason
+          type: string
+          jsonPath: .status.reason
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: >
+            One Hermes personal agent for one Twake Space user. The resource
+            name is derived from the username: lowercased, with dots replaced
+            by hyphens.
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              description: What the agent should be.
+              required: [username]
+              properties:
+                username:
+                  type: string
+                  description: >
+                    The Twake username. The operator refuses a resource whose
+                    name is not the one derived from this. Letters, digits and
+                    single inner dots, 3 to 30 characters; the operator also
+                    refuses a username made only of digits, which RE2 cannot
+                    express.
+                  minLength: 3
+                  maxLength: 30
+                  pattern: "^[a-zA-Z0-9]+(\\.[a-zA-Z0-9]+)*$"
+                profile:
+                  type: object
+                  description: >
+                    The settings copied onto the resource, limited to what the
+                    agent needs. No extra personal data is stored.
+                  properties:
+                    firstName:
+                      type: string
+                    displayName:
+                      type: string
+                    language:
+                      type: string
+                    timezone:
+                      type: string
+                settingsVersion:
+                  type: integer
+                  format: int64
+                  description: >
+                    The settings version the listener last wrote. Absent on
+                    resources created by hand.
+            status:
+              type: object
+              description: What the operator observed.
+              properties:
+                phase:
+                  type: string
+                  enum: [Pending, Provisioning, Ready, Deleting, Failed]
+                reason:
+                  type: string
+                  description: A human-readable reason for the phase.
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status]
+                    properties:
+                      type:
+                        type: string
+                        description: One per step, e.g. botRegistered, workloadReady, welcomed.
+                      status:
+                        type: string
+                        enum: ["True", "False", "Unknown"]
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [type]
+                botUserId:
+                  type: string
+                  description: The Matrix ID of the agent's bot.
+                deviceId:
+                  type: string
+                  description: The fixed Matrix device ID of the agent's bot.
+                dmRoomId:
+                  type: string
+                  description: The direct conversation's room ID.
+                observedGeneration:
+                  type: integer
+                  format: int64
