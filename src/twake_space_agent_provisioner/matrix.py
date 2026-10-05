@@ -47,7 +47,7 @@ class RateLimited(HomeserverError):
         self.retry_after_ms = retry_after_ms
 
 
-def classify(status: int, body: Any) -> HomeserverError:
+def classify(status: int, body: Any, headers: Any = None) -> HomeserverError:
     """Turn a failed Matrix answer into an error the caller can act on.
 
     A body that is not a JSON object (an HTML error page, say) still yields a
@@ -62,7 +62,7 @@ def classify(status: int, body: Any) -> HomeserverError:
             errcode=errcode,
             message=message,
             status=status,
-            retry_after_ms=int(body.get("retry_after_ms") or 0),
+            retry_after_ms=_retry_after_ms(body, headers),
         )
     return HomeserverError(
         errcode=errcode,
@@ -70,6 +70,35 @@ def classify(status: int, body: Any) -> HomeserverError:
         status=status,
         retryable=status >= 500 or status in (408, 429),
     )
+
+
+def _retry_after_ms(body: dict[str, Any], headers: Any) -> int:
+    """The wait a rate limit asks for, in milliseconds.
+
+    Read from ``retry_after_ms`` (the body, the older spelling) or from the
+    ``Retry-After`` header (seconds; the newer spelling, per RFC 9110). Both
+    are read tolerantly: a value that is missing, or not a number, means the
+    homeserver asked for nothing, not that the call failed differently.
+    """
+    asked = body.get("retry_after_ms")
+    if asked is None and headers is not None:
+        header = headers.get("Retry-After")
+        if header is not None:
+            try:
+                asked = float(header) * 1000
+            except (TypeError, ValueError):
+                asked = None
+    try:
+        return max(0, int(float(asked)))
+    except (TypeError, ValueError):
+        return 0
+
+
+#: A ceiling for a delay the homeserver itself asks for. Our own backoff caps
+#: at ``cap``; a rate limit's ask is honoured in full up to this, because the
+#: homeserver knows its own load and coming back sooner only prolongs the
+#: limit. The ceiling only guards against a nonsensical value.
+MAX_SERVER_DELAY = 3600.0
 
 
 def retry_delay(
@@ -81,13 +110,13 @@ def retry_delay(
 ) -> float:
     """Seconds to wait before try ``attempt`` (1 is the first retry).
 
-    A doubling backoff, capped. A rate limit that asks for longer than the
-    backoff sets the pace instead: the homeserver knows its own load.
+    A doubling backoff, capped by ``cap``. A rate limit that asks for longer
+    sets the pace instead: the homeserver knows its own load, so its ask is
+    honoured rather than clipped to our own cap.
     """
     delay = min(base * (2 ** (attempt - 1)), cap)
     if rate_limit is not None:
-        asked = rate_limit.retry_after_ms / 1000
-        delay = max(delay, min(asked, cap))
+        delay = max(delay, min(rate_limit.retry_after_ms / 1000, MAX_SERVER_DELAY))
     return delay
 
 
@@ -121,26 +150,40 @@ class MatrixAppservice:
         base_url: str,
         appservice_token: str,
         timeout: float = 10.0,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._token = appservice_token
-        self._client = httpx.AsyncClient(base_url=self._base_url, timeout=timeout)
+        self._client = httpx.AsyncClient(
+            base_url=self._base_url, timeout=timeout, transport=transport
+        )
 
     async def close(self) -> None:
         await self._client.aclose()
 
     async def _call(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         headers = {"Authorization": f"Bearer {self._token}"}
-        response = await self._client.request(method, path, headers=headers, **kwargs)
+        try:
+            response = await self._client.request(method, path, headers=headers, **kwargs)
+        except httpx.TransportError as exc:
+            # An unreachable homeserver is an outage like any other: it must
+            # feed the same backoff and status reason, not escape the handler
+            # as a raw exception for kopf to retry blindly.
+            error = HomeserverError(
+                errcode="M_UNREACHABLE",
+                message=f"{type(exc).__name__}: {exc}",
+                status=0,
+                retryable=True,
+            )
+            logger.warning("homeserver unreachable for %s %s: %s", method, path, error)
+            raise error from exc
         if response.status_code >= 400:
             try:
                 body = response.json()
             except ValueError:
                 body = None
-            error = classify(response.status_code, body)
-            logger.warning(
-                "homeserver refused %s %s: %s", method, path, error
-            )
+            error = classify(response.status_code, body, response.headers)
+            logger.warning("homeserver refused %s %s: %s", method, path, error)
             raise error
         return response
 

@@ -43,14 +43,26 @@ def _kubectl(*args: str, input_text: str | None = None) -> subprocess.CompletedP
 
 
 @pytest.fixture(scope="session")
-def homeserver() -> Iterator[FakeHomeserver]:
+def homeserver_server() -> Iterator[FakeHomeserver]:
     """The fake homeserver: the only fake, standing for Synapse.
 
     Session-scoped so the port is stable for every template that points at it.
+    Tests take `homeserver`, which resets this between them.
     """
     server = FakeHomeserver(appservice_token=APPSERVICE_TOKEN).start()
     yield server
     server.stop()
+
+
+@pytest.fixture
+def homeserver(homeserver_server: FakeHomeserver) -> Iterator[FakeHomeserver]:
+    """The fake homeserver, emptied for this test.
+
+    Its recorded calls must start empty: a test asserting "one login" would
+    otherwise pass or fail on the order pytest ran in.
+    """
+    homeserver_server.reset()
+    yield homeserver_server
 
 
 @pytest.fixture(scope="session")
@@ -148,7 +160,9 @@ def _personalagent_names(context: str, namespace: str) -> list[str]:
 
 
 @pytest.fixture
-def template_file(tmp_path: Path, stub_image: str, homeserver: FakeHomeserver) -> Path:
+def template_file(
+    tmp_path: Path, stub_image: str, homeserver_server: FakeHomeserver
+) -> Path:
     """The agent template, pointed at the stub image and the fake homeserver."""
     path = tmp_path / "template.yaml"
     path.write_text(
@@ -164,8 +178,8 @@ persistence:
   size: 10Mi
   storageClass: ""
 homeserver:
-  url: {homeserver.url}
-  serverName: {homeserver.server_name}
+  url: {homeserver_server.url}
+  serverName: {homeserver_server.server_name}
 ceiling: 50
 defaultLanguage: fr
 managedConfig:

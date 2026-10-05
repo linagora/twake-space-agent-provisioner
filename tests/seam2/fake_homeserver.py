@@ -96,6 +96,20 @@ class FakeHomeserver:
     def __exit__(self, *_exc: object) -> None:
         self.stop()
 
+    def reset(self) -> None:
+        """Forget every recorded call and every user.
+
+        The server outlives one test (its port is fixed for the whole session),
+        so each test must start from a clean slate: a test that counts calls
+        would otherwise pass or fail on the order pytest ran in.
+        """
+        with self._lock:
+            self.calls.clear()
+            self.users.clear()
+            self.fail_next = 0
+            self.rate_limit_next = 0
+            self.rate_limit_ms = 0
+
     # -- recorded calls ----------------------------------------------------
 
     def calls_to(self, path_contains: str) -> list[Call]:

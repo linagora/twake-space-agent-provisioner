@@ -101,6 +101,39 @@ def test_registration_reads_user_in_use_as_success(
     )
 
 
+def test_completes_a_secret_left_without_a_token(
+    operator: OperatorHarness, homeserver: FakeHomeserver
+) -> None:
+    """A Secret that exists without a token is completed, not left alone.
+
+    The pilot takeover and the walking skeleton both leave such a Secret. If
+    the operator skipped it, it would log in again on every pass and roll the
+    pod on a checksum that never settles.
+    """
+    operator.kubectl.create(
+        {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "type": "Opaque",
+            "metadata": {"name": SECRET_NAME, "namespace": operator.namespace},
+            "stringData": {"API_SERVER_KEY": "the-key-from-the-pilot"},
+        }
+    )
+    operator.kubectl.create(agent_manifest(operator.namespace))
+
+    secret = operator.wait_for(
+        lambda: _token(operator), message="the pre-existing secret was never completed"
+    )
+    assert secret
+
+    # One login, not one per pass, and the pilot's key survives.
+    time.sleep(4)
+    assert len(homeserver.logins()) == 1
+    assert _secret(operator)["data"]["API_SERVER_KEY"] == (
+        base64.b64encode(b"the-key-from-the-pilot").decode()
+    )
+
+
 def test_the_agent_answers_its_owner_alone(
     operator: OperatorHarness, homeserver: FakeHomeserver
 ) -> None:
@@ -164,9 +197,13 @@ def test_the_operator_honours_the_rate_limits_retry_delay(
 
 
 def test_a_permanent_refusal_fails_the_agent_instead_of_looping(
-    operator_with_bad_token: OperatorHarness,
+    operator_with_bad_token: OperatorHarness, homeserver: FakeHomeserver
 ) -> None:
-    """A bad appservice token is not something a retry fixes."""
+    """A bad appservice token fails the agent, and does not loop.
+
+    The token is the wrong one, so the homeserver answers 401: a permanent
+    refusal the operator must not retry forever.
+    """
     operator = operator_with_bad_token
     operator.kubectl.create(agent_manifest(operator.namespace))
 
@@ -178,8 +215,15 @@ def test_a_permanent_refusal_fails_the_agent_instead_of_looping(
         return agent if status.get("phase") == "Failed" else None
 
     agent = operator.wait_for(failed, message="the agent never failed on a bad token")
-    reason = str(agent["status"].get("reason") or "")
-    assert reason.startswith("Homeserver") or reason == "NoAppserviceToken"
+    assert agent["status"]["reason"] == "HomeserverM_UNKNOWN_TOKEN"
+    # The 401 really came from the homeserver, not from a missing token.
+    assert homeserver.calls_to("/login") or homeserver.calls_to("/register")
+
+    # Several reconcile intervals pass; the refusal is remembered, so the
+    # homeserver is not asked again for this generation.
+    asked = len(homeserver.calls)
+    time.sleep(4)
+    assert len(homeserver.calls) == asked
 
 
 def test_the_appservice_token_never_reaches_the_agents_objects(

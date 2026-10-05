@@ -71,6 +71,10 @@ class Context:
     #: Per-agent retry gate, so a homeserver outage backs off instead of
     #: hammering. In-memory is enough: a restart just means one more reconcile.
     retries: dict[str, Retry] = field(default_factory=dict)
+    #: Refusals a retry cannot fix, {name: (generation, reason)}. Remembered so
+    #: the timer does not re-ask the homeserver every pass forever; a change to
+    #: the spec bumps the generation and buys one fresh attempt.
+    refusals: dict[str, tuple[int, str]] = field(default_factory=dict)
 
 
 @kopf.on.startup()
@@ -148,6 +152,19 @@ async def reconcile(body: kopf.Body, patch: kopf.Patch, memo: kopf.Memo, **_: An
         _fail(body, patch, log, "InvalidUsername", f"invalid username {username!r}")
         return
 
+    # A refusal already known for this generation: fail again without asking
+    # the homeserver. Re-asking every interval would send the same doomed
+    # request forever, once per agent.
+    generation = body["metadata"].get("generation")
+    refusal = context.refusals.get(name)
+    if refusal is not None:
+        refused_generation, refusal_reason = refusal
+        if refused_generation == generation:
+            patch.status["phase"] = PHASE_FAILED
+            patch.status["reason"] = refusal_reason
+            return
+        del context.refusals[name]
+
     if context.matrix is None:
         _fail(
             body,
@@ -213,12 +230,18 @@ async def reconcile(body: kopf.Body, patch: kopf.Patch, memo: kopf.Memo, **_: An
         ai_gateway_secret_name=context.config.ai_gateway_secret_name,
     )
 
+    # The Secret is written first, so a token just obtained is persisted before
+    # anything else can fail and force a new session on the next pass. It is
+    # replaceable because the API server key in it is reused from the cluster
+    # (`_reuse_or_generate_api_server_key`), so the rendered Secret only ever
+    # adds what was missing. A Secret that already exists without a token —
+    # a reinstall, a pilot takeover — is completed here rather than left alone,
+    # which is what would otherwise re-login and roll the pod on every pass.
+    await context.cluster.apply_updatable(objects.secret, context.config.namespace)
     # The ConfigMap, the NetworkPolicy and the StatefulSet carry no generated
     # state, so replacing them is safe: the StatefulSet's checksum annotations
     # are what roll the pod when the configuration or the template changes.
-    # The Secret holds the generated key and must not be rewritten.
     await context.cluster.apply_updatable(objects.configmap, context.config.namespace)
-    await context.cluster.apply(objects.secret, context.config.namespace)
     await context.cluster.apply_updatable(objects.networkpolicy, context.config.namespace)
     await context.cluster.apply_updatable(objects.statefulset, context.config.namespace)
     log.info("workload applied for username %s", username)
@@ -311,17 +334,19 @@ async def _retry_later(
     agent waits, so an outage is visible on every pass, not only on the one
     that met it. A rate limit sets the pace when it asks for longer than our
     own backoff: the homeserver knows its own load. A refusal a retry cannot
-    fix (a bad appservice token, say) fails the agent outright instead of
-    looping forever.
+    fix (a bad appservice token, say) fails the agent outright and is remembered
+    against the current generation, so the timer does not re-ask every pass.
     """
     if not error.retryable:
+        reason = f"Homeserver{error.errcode}"
         _fail(
             body,
             patch,
             log,
-            f"Homeserver{error.errcode}",
+            reason,
             f"the homeserver refused {error.errcode}: {error.message}",
         )
+        context.refusals[name] = (body["metadata"].get("generation"), reason)
         return
 
     attempts = context.retries[name].attempts + 1 if name in context.retries else 1
