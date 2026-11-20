@@ -2,6 +2,8 @@
 
 Kubernetes operator that runs one Hermes personal agent per Twake Space user who turns on the assistant.
 
+- Decisions: `docs/decisions.md`, mandatory. Search it before asking a question or proposing a change; record every decision there, in the commit that applies it (skill `twake-decisions`).
+
 ## Agent skills
 
 ### Issue tracker
